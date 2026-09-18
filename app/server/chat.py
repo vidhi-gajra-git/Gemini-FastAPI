@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse
 from gemini_webapi import ModelOutput
 from gemini_webapi.client import ChatSession
 from gemini_webapi.constants import Model
+from gemini_webapi.types import AvailableModel
 from gemini_webapi.types.image import GeneratedImage, Image
 from loguru import logger
 
@@ -800,18 +801,35 @@ def _instructions_to_messages(
     return instruction_messages
 
 
-def _get_model_by_name(name: str) -> Model:
-    """Retrieve a Model instance by name."""
-    strategy = g_config.gemini.model_strategy
-    custom_models = {m.model_name: m for m in g_config.gemini.models if m.model_name}
 
-    if name in custom_models:
-        return Model.from_dict(custom_models[name].model_dump())
 
-    if strategy == "overwrite":
-        raise ValueError(f"Model '{name}' not found in custom models (strategy='overwrite').")
+def _get_configured_model(name: str) -> AvailableModel | None:
+    """Return a configured custom model as an AvailableModel, if one exists."""
+    for configured in g_config.gemini.models:
+        if configured.model_name != name:
+            continue
+        return AvailableModel.from_dict(configured.model_dump())
+    return None
 
-    return Model.from_name(name)
+
+def _validate_model_name(name: str) -> None:
+    """Validate model selection policy without using the removed Model enum resolvers."""
+    if _get_configured_model(name) is not None:
+        return
+
+    if g_config.gemini.model_strategy == "overwrite":
+        raise ValueError(
+            f"Model '{name}' not found in custom models "
+            "(strategy='overwrite')."
+        )
+
+
+def _model_argument(name: str) -> str | AvailableModel:
+    """Return the value accepted by gemini-webapi 2.x ChatSession."""
+    custom_model = _get_configured_model(name)
+    if custom_model is not None:
+        return custom_model
+    return name
 
 
 def _get_available_models() -> list[ModelData]:
@@ -853,7 +871,7 @@ def _get_available_models() -> list[ModelData]:
 async def _find_reusable_session(
     db: LMDBConversationStore,
     pool: GeminiClientPool,
-    model: Model,
+    model_name: str,
     messages: list[Message],
 ) -> tuple[ChatSession | None, GeminiClientWrapper | None, list[Message]]:
     """Find an existing chat session matching the longest suitable history prefix."""
@@ -865,14 +883,14 @@ async def _find_reusable_session(
         search_history = messages[:search_end]
         if search_history[-1].role in {"assistant", "system", "tool"}:
             try:
-                if conv := db.find(model.model_name, search_history):
+                if conv := db.find(model_name, search_history):
                     now = datetime.now()
                     updated_at = conv.updated_at or conv.created_at or now
                     age_minutes = (now - updated_at).total_seconds() / 60
                     if age_minutes <= METADATA_TTL_MINUTES:
                         client = await pool.acquire(conv.client_id)
                         try:
-                            session = client.start_chat(metadata=conv.metadata, model=model)
+                            session = client.start_chat(metadata=conv.metadata, model=_model_argument(model_name))
                         except Exception as exc:
                             logger.warning(
                                 f"Failed to reuse metadata chat at prefix length {search_end}: {exc}"
@@ -951,7 +969,7 @@ def _is_missing_chat_error(exc: Exception) -> bool:
 async def _send_with_internal_fallback(
     *,
     pool: GeminiClientPool,
-    model: Model,
+    model_name: str,
     session: ChatSession,
     client: GeminiClientWrapper,
     current_input: str,
@@ -984,7 +1002,7 @@ async def _send_with_internal_fallback(
             "Metadata-backed chat reuse failed; retrying with internal history replay in a fresh chat."
         )
         fallback_client = await pool.acquire()
-        fallback_session = fallback_client.start_chat(model=model)
+        fallback_session = fallback_client.start_chat(model=_model_argument(model_name))
         fallback_input, fallback_files = await _process_conversation_with_compaction(
             full_prepared_messages,
             tmp_dir,
@@ -1097,7 +1115,6 @@ def _create_real_streaming_response(
     model_name: str,
     messages: list[Message],
     db: LMDBConversationStore,
-    model: Model,
     client_wrapper: GeminiClientWrapper,
     session: ChatSession,
     base_url: str,
@@ -1267,7 +1284,7 @@ def _create_real_streaming_response(
         }
         _persist_conversation(
             db,
-            model.model_name,
+            model_name,
             client_wrapper.id,
             session.metadata,
             messages,
@@ -1288,7 +1305,6 @@ def _create_responses_real_streaming_response(
     model_name: str,
     messages: list[Message],
     db: LMDBConversationStore,
-    model: Model,
     client_wrapper: GeminiClientWrapper,
     session: ChatSession,
     request: ResponseCreateRequest,
@@ -1721,7 +1737,7 @@ def _create_responses_real_streaming_response(
         )
         _persist_conversation(
             db,
-            model.model_name,
+            model_name,
             client_wrapper.id,
             session.metadata,
             messages,
@@ -1764,7 +1780,8 @@ async def create_chat_completion(
     base_url = str(raw_request.base_url)
     pool, db = GeminiClientPool(), LMDBConversationStore()
     try:
-        model = _get_model_by_name(request.model)
+        model_name = request.model
+        _validate_model_name(model_name)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     if not request.messages:
@@ -1781,7 +1798,7 @@ async def create_chat_completion(
         extra_instr,
     )
 
-    session, client, remain = await _find_reusable_session(db, pool, model, msgs)
+    session, client, remain = await _find_reusable_session(db, pool, model_name, msgs)
     reused_session = session is not None
     use_google_temporary_mode = g_config.gemini.chat_mode == ChatMode.TEMPORARY
 
@@ -1811,7 +1828,7 @@ async def create_chat_completion(
     else:
         try:
             client = await pool.acquire()
-            session = client.start_chat(model=model)
+            session = client.start_chat(model=_model_argument(model_name))
             # Use the already prepared 'msgs' for a fresh session
             m_input, files = await _process_conversation_with_compaction(
                 msgs,
@@ -1834,7 +1851,7 @@ async def create_chat_completion(
         )
         resp_or_stream, session, client = await _send_with_internal_fallback(
             pool=pool,
-            model=model,
+            model_name=model_name,
             session=session,
             client=client,
             current_input=m_input,
@@ -1857,7 +1874,7 @@ async def create_chat_completion(
             request.model,
             msgs,  # Use prepared 'msgs'
             db,
-            model,
+            model_name,
             client,
             session,
             base_url,
@@ -1923,7 +1940,7 @@ async def create_chat_completion(
     )
     _persist_conversation(
         db,
-        model.model_name,
+        model_name,
         client.id,
         session.metadata,
         msgs,  # Use prepared messages 'msgs'
@@ -1980,11 +1997,12 @@ async def create_response(
     )
     pool, db = GeminiClientPool(), LMDBConversationStore()
     try:
-        model = _get_model_by_name(request.model)
+        model_name = request.model
+        _validate_model_name(model_name)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    session, client, remain = await _find_reusable_session(db, pool, model, messages)
+    session, client, remain = await _find_reusable_session(db, pool, model_name, messages)
     reused_session = session is not None
     use_google_temporary_mode = g_config.gemini.chat_mode == ChatMode.TEMPORARY
     if session:
@@ -2009,7 +2027,7 @@ async def create_response(
     else:
         try:
             client = await pool.acquire()
-            session = client.start_chat(model=model)
+            session = client.start_chat(model=_model_argument(model_name))
             m_input, files = await _process_conversation_with_compaction(
                 messages,
                 tmp_dir,
@@ -2031,7 +2049,7 @@ async def create_response(
         )
         resp_or_stream, session, client = await _send_with_internal_fallback(
             pool=pool,
-            model=model,
+            model_name=model_name,
             session=session,
             client=client,
             current_input=m_input,
@@ -2054,7 +2072,7 @@ async def create_response(
             request.model,
             messages,
             db,
-            model,
+            model_name,
             client,
             session,
             request,
@@ -2152,7 +2170,7 @@ async def create_response(
     )
     _persist_conversation(
         db,
-        model.model_name,
+        model_name,
         client.id,
         session.metadata,
         messages,
